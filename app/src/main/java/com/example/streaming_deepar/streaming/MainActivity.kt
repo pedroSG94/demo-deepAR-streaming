@@ -7,7 +7,6 @@ import ai.deepar.ar.DeepAR
 import ai.deepar.ar.DeepARImageFormat
 import android.Manifest
 import android.content.pm.ActivityInfo
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.media.Image
 import android.opengl.GLSurfaceView
@@ -16,7 +15,8 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.util.Size
 import android.view.Surface
-import android.view.View
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageButton
@@ -29,11 +29,9 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.example.streaming_deepar.R
-import com.example.streaming_deepar.streaming.DeepARRenderer.MyContextFactory
 import com.google.common.util.concurrent.ListenableFuture
 import com.pedro.common.ConnectChecker
 import com.pedro.encoder.input.sources.audio.MicrophoneSource
-import com.pedro.encoder.input.sources.video.NoVideoSource
 import com.pedro.library.rtmp.RtmpStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -48,23 +46,14 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
     private var buffers: Array<ByteBuffer?>? = null
     private var allocatedBufferSize = 0
     private var currentBuffer = 0
-    private var deepAR: DeepAR? = null
-    private var surfaceView: GLSurfaceView? = null
-    private var renderer: DeepARRenderer? = null
     private var currentEffect = 0
     private var isPrepare = false
-
-    //    private RtcEngine mRtcEngine;
     private var callInProgress = false
-    private val rtmpDeepAR: RtmpDeepAR by lazy {
-        RtmpDeepAR(context = this, connectChecker= this, videoSource = NoVideoSource(), audioSource = MicrophoneSource()).apply {
-            getGlInterface().autoHandleOrientation = true
-            getStreamClient().setBitrateExponentialFactor(0.5f)
-        }
-    }
+
+    private val deepARSource by lazy { DeepARSource(this, "160917e95e2b31ddff1bfc3a34afd89323efaa94252e35271161eb0ff51d512fa71025338787930a", this) }
 
     private val rtmpStream: RtmpStream by lazy {
-        RtmpStream(context = this, connectChecker= this, videoSource = RGABSource(), audioSource = MicrophoneSource()).apply {
+        RtmpStream(context = this, connectChecker= this, videoSource = deepARSource, audioSource = MicrophoneSource()).apply {
             getGlInterface().autoHandleOrientation = true
             getStreamClient().setBitrateExponentialFactor(0.5f)
         }
@@ -75,20 +64,27 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
     private val isStereo = true
     private val aBitrate = 128 * 1000
 
-    private var remoteViewContainer: FrameLayout? = null
     var effects: ArrayList<String> = arrayListOf()
-    lateinit var preview: FrameLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        deepAR = DeepAR(this)
-        deepAR!!.setLicenseKey("160917e95e2b31ddff1bfc3a34afd89323efaa94252e35271161eb0ff51d512fa71025338787930a")
-        deepAR!!.initialize(this, this)
-        deepAR?.startCapture()
         setContentView(R.layout.activity_main_streaming)
-        preview = findViewById(R.id.localPreview)
         callInProgress = false
-        remoteViewContainer = findViewById<FrameLayout>(R.id.remote_video_view_container)
+        val surfaceView = findViewById<SurfaceView>(R.id.surfaceview)
+        prepare()
+        surfaceView.holder.addCallback(object: SurfaceHolder.Callback {
+            override fun surfaceCreated(p0: SurfaceHolder) {
+                rtmpStream.startPreview(surfaceView)
+            }
+
+            override fun surfaceChanged(p0: SurfaceHolder, format: Int, width: Int, height: Int) {
+                rtmpStream.getGlInterface().setPreviewResolution(width, height)
+            }
+
+            override fun surfaceDestroyed(p0: SurfaceHolder) {
+                rtmpStream.stopPreview()
+            }
+        })
     }
 
     override fun onStart() {
@@ -110,12 +106,6 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-//        for (grantResult in grantResults) {
-//            if (grantResult != PackageManager.PERMISSION_GRANTED) {
-//                ActivityCompat.requestPermissions(this, permissions, requestCode)
-//                return
-//            }
-//        }
         setup()
     }
 
@@ -168,35 +158,15 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
 
    private fun setup() {
         setupCamera()
-        initializeEngine()
         initializeFilters()
-
-        //        setupVideoConfig();
-        surfaceView = GLSurfaceView(this)
-        surfaceView!!.setEGLContextClientVersion(2)
-        surfaceView!!.setEGLConfigChooser(8, 8, 8, 8, 16, 0)
-        renderer = DeepARRenderer(deepAR!!, rtmpStream, this)
-
-        surfaceView!!.setEGLContextFactory(MyContextFactory(renderer!!))
-
-        surfaceView!!.setRenderer(renderer)
-        surfaceView!!.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-
-        preview = findViewById<FrameLayout>(R.id.localPreview)
-        preview.addView(surfaceView)
-
         val btn = findViewById<Button>(R.id.startCall)
-        //        mRtcEngine.setExternalVideoSource(true, true, true);
         btn.setOnClickListener {
             if (callInProgress) {
                 callInProgress = false
-                renderer!!.isCallInProgress = false
-                //                    mRtcEngine.leaveChannel();
-                onRemoteUserLeft()
+                joinChannel()
                 btn.text = "Start the call"
             } else {
                 callInProgress = true
-                renderer!!.isCallInProgress = true
                 joinChannel()
                 btn.text = "End the call"
             }
@@ -207,13 +177,12 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
         findViewById<ImageButton>(R.id.nextMask).setOnClickListener {
             gotoPrevious()
         }
-        prepare()
+
     }
 
     private fun prepare() {
         val prepared = try {
-            Log.d(TAG,"width: ${preview.width}, height: ${preview.height}")
-            rtmpStream.prepareVideo(preview.width, preview.height, vBitrate, rotation = rotation) &&
+            rtmpStream.prepareVideo(640, 480, vBitrate, rotation = rotation) &&
                     rtmpStream.prepareAudio(sampleRate, isStereo, aBitrate)
         } catch (e: IllegalArgumentException) {
             false
@@ -226,12 +195,12 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
 
     private fun gotoNext() {
         currentEffect = (currentEffect + 1) % effects!!.size
-        deepAR!!.switchEffect("effect", getFilterPath(effects!![currentEffect]))
+        deepARSource.deepAR.switchEffect("effect", getFilterPath(effects!![currentEffect]))
     }
 
     private fun gotoPrevious() {
         currentEffect = (currentEffect - 1 + effects!!.size) % effects!!.size
-        deepAR!!.switchEffect("effect", getFilterPath(effects!![currentEffect]))
+        deepARSource.deepAR.switchEffect("effect", getFilterPath(effects!![currentEffect]))
     }
 
 
@@ -302,7 +271,7 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
 
     private fun setupCamera() {
         cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture!!.addListener({
+        cameraProviderFuture?.addListener({
             try {
                 val cameraProvider = cameraProviderFuture!!.get()
                 bindImageAnalysis(cameraProvider)
@@ -402,8 +371,8 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
 
             buffers!![currentBuffer]!!.put(byteData)
             buffers!![currentBuffer]!!.position(0)
-            if (deepAR != null) {
-                deepAR!!.receiveFrame(
+            if (deepARSource.isRunning()) {
+                deepARSource.deepAR.receiveFrame(
                     buffers!![currentBuffer],
                     image.width, image.height,
                     image.imageInfo.rotationDegrees,
@@ -433,48 +402,17 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
         allocatedBufferSize = size
     }
 
-    fun setRemoteViewWeight(weight: Float) {
-        val params = remoteViewContainer!!.layoutParams as LinearLayout.LayoutParams
-        params.weight = weight
-        remoteViewContainer!!.layoutParams = params
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (surfaceView != null) {
-            surfaceView!!.onResume()
-        }
-    }
-
-    override fun onPause() {
-        super.onPause()
-        if (surfaceView != null) {
-            surfaceView!!.onPause()
-        }
-    }
-
     override fun onStop() {
         var cameraProvider: ProcessCameraProvider? = null
         try {
-            cameraProvider = cameraProviderFuture!!.get()
-            cameraProvider.unbindAll()
+            cameraProvider = cameraProviderFuture?.get()
+            cameraProvider?.unbindAll()
         } catch (e: ExecutionException) {
             e.printStackTrace()
         } catch (e: InterruptedException) {
             e.printStackTrace()
         }
         super.onStop()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        deepAR!!.release()
-        //        mRtcEngine.leaveChannel();
-//        RtcEngine.destroy();
-    }
-
-    private fun initializeEngine() {
-
     }
 
     private fun joinChannel() {
@@ -485,10 +423,6 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
         }
     }
 
-    private fun onRemoteUserLeft() {
-        remoteViewContainer!!.removeAllViews()
-        setRemoteViewWeight(0f)
-    }
 
     override fun screenshotTaken(bitmap: Bitmap) {
     }
@@ -514,7 +448,7 @@ class MainActivity : AppCompatActivity(), AREventListener, ConnectChecker {
     }
 
     override fun initialized() {
-        deepAR!!.switchEffect("mask", "file:///android_asset/aviators")
+        deepARSource.deepAR.switchEffect("mask", "file:///android_asset/aviators")
     }
 
     override fun faceVisibilityChanged(b: Boolean) {

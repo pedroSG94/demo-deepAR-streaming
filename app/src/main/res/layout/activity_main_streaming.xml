@@ -29,6 +29,11 @@
                 android:layout_weight="0"/>
 
         </LinearLayout>
+        <SurfaceView
+            android:id="@+id/surfaceview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            />
         <Button
             android:id="@+id/startCall"
             android:layout_width="200dp"
